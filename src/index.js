@@ -41,10 +41,37 @@ const apiLimiter = rateLimit({
 
 const db = require("./database");
 db.ready.then(() => {
-  app.use("/api/auth", authLimiter, require("./routes/auth"));
-  app.use("/api/users",    apiLimiter, require("./routes/users"));
-  app.use("/api/contacts", apiLimiter, require("./routes/contacts"));
-  app.use("/api/assets",   apiLimiter, require("./routes/assets"));
+  try {
+  const authRoutes = require("./routes/auth");
+  console.log("AUTH ROUTES:");
+  console.log(authRoutes);
+  console.log("TYPE:", typeof authRoutes);
+
+  const userRoutes = require("./routes/users");
+  console.log("USERS ROUTES:");
+  console.log(userRoutes);
+  console.log("TYPE:", typeof userRoutes);
+
+  const contactRoutes = require("./routes/contacts");
+  console.log("CONTACTS ROUTES:");
+  console.log(contactRoutes);
+  console.log("TYPE:", typeof contactRoutes);
+
+  const assetRoutes = require("./routes/assets");
+  console.log("ASSETS ROUTES:");
+  console.log(assetRoutes);
+  console.log("TYPE:", typeof assetRoutes);
+
+  app.use("/api/auth", authLimiter, authRoutes);
+  app.use("/api/users", apiLimiter, userRoutes);
+  app.use("/api/contacts", apiLimiter, contactRoutes);
+  app.use("/api/assets", apiLimiter, assetRoutes);
+
+} catch (err) {
+  console.error("ROUTE LOAD ERROR:");
+  console.error(err);
+  process.exit(1);
+}
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
   app.use((err, _req, res, _next) => {
     console.error(err);
