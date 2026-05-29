@@ -1,145 +1,61 @@
-require("dotenv").config();
-const path = require("path");
-const fs = require("fs");
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { v4: uuidv4 } = require("uuid");
+const db = require("../database");
 
-// ── Choose driver based on environment ───────────────────────────────────────
-// Production: Turso (libsql) via TURSO_URL + TURSO_AUTH_TOKEN
-// Development: local sql.js SQLite file
+const router = express.Router();
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-const IS_TURSO = !!process.env.TURSO_URL;
-
-let db = null;
-let _resolve, _reject;
-const ready = new Promise((res, rej) => { _resolve = res; _reject = rej; });
-
-// ── Schema ────────────────────────────────────────────────────────────────────
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS users (
-    id          TEXT PRIMARY KEY,
-    email       TEXT UNIQUE NOT NULL,
-    password    TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'ACTIVE',
-    last_active INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-  CREATE TABLE IF NOT EXISTS contacts (
-    id            TEXT PRIMARY KEY,
-    user_id       TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    email         TEXT NOT NULL,
-    verified      INTEGER NOT NULL DEFAULT 0,
-    confirm_token TEXT UNIQUE,
-    confirmed_at  INTEGER,
-    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-  CREATE TABLE IF NOT EXISTS assets (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    category   TEXT NOT NULL,
-    data       TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-  CREATE TABLE IF NOT EXISTS inactivity_warnings (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    sent_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-`;
-
-// ── Turso (production) ────────────────────────────────────────────────────────
-async function initTurso() {
-  const { createClient } = require("@libsql/client");
-  const client = createClient({
-    url: process.env.TURSO_URL,
-    authToken: process.env.TURSO_AUTH_TOKEN,
-  });
-
-  // Run each statement individually (Turso doesn't support multi-statement batch in execute)
-  const statements = SCHEMA.split(";").map(s => s.trim()).filter(Boolean);
-  for (const stmt of statements) {
-    await client.execute(stmt);
-  }
-
-  // Wrap to match the synchronous-style API used throughout the codebase
-  db = {
-    prepare(sql) {
-      return {
-        async run(...params) {
-          return client.execute({ sql, args: params });
-        },
-        async get(...params) {
-          const res = await client.execute({ sql, args: params });
-          return res.rows[0] ? Object.fromEntries(Object.entries(res.rows[0])) : undefined;
-        },
-        async all(...params) {
-          const res = await client.execute({ sql, args: params });
-          return res.rows.map(row => Object.fromEntries(Object.entries(row)));
-        },
-      };
-    },
-  };
-
-  // Make all routes async-aware: wrap prepare to return thenables
-  console.log("✅  Database ready: Turso (remote)");
-  _resolve();
+function validatePassword(password) {
+  if (!password || password.length < 8) return "Password must be at least 8 characters.";
+  if (!/[A-Z]/.test(password)) return "Password must contain at least one uppercase letter.";
+  if (!/[0-9]/.test(password)) return "Password must contain at least one number.";
+  return null;
 }
 
-// ── sql.js (local dev) ────────────────────────────────────────────────────────
-async function initLocal() {
-  const initSqlJs = require("sql.js");
-  const DB_PATH = path.join(__dirname, "../../data/digital_life.db");
-  const dataDir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+router.post("/register", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: "Email and password required." });
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ message: "Invalid email address." });
+    const pwError = validatePassword(password);
+    if (pwError) return res.status(400).json({ message: pwError });
 
-  const SQL = await initSqlJs();
-  let localDb;
-  if (fs.existsSync(DB_PATH)) {
-    localDb = new SQL.Database(fs.readFileSync(DB_PATH));
-  } else {
-    localDb = new SQL.Database();
+    const existing = await db.prepare("SELECT id FROM users WHERE email = ?").get(email.toLowerCase());
+    if (existing) return res.status(409).json({ message: "An account with this email already exists. Please sign in instead." });
+
+    const hashed = await bcrypt.hash(password, 12);
+    const id = uuidv4();
+    const now = Math.floor(Date.now() / 1000);
+    await db.prepare("INSERT INTO users (id, email, password, last_active, created_at) VALUES (?, ?, ?, ?, ?)").run(id, email.toLowerCase(), hashed, now, now);
+    const token = jwt.sign({ userId: id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.status(201).json({ token, message: "Registration successful." });
+  } catch (err) {
+    console.error("Register error:", err);
+    res.status(500).json({ message: "Internal server error." });
   }
-
-  function persist() {
-    fs.writeFileSync(DB_PATH, Buffer.from(localDb.export()));
-  }
-
-  localDb.run(SCHEMA);
-  persist();
-
-  db = {
-    prepare(sql) {
-      return {
-        run(...params) { localDb.run(sql, params); persist(); return { changes: localDb.getRowsModified() }; },
-        get(...params) {
-          const stmt = localDb.prepare(sql);
-          stmt.bind(params);
-          const row = stmt.step() ? stmt.getAsObject() : undefined;
-          stmt.free();
-          return row;
-        },
-        all(...params) {
-          const rows = [];
-          const stmt = localDb.prepare(sql);
-          stmt.bind(params);
-          while (stmt.step()) rows.push(stmt.getAsObject());
-          stmt.free();
-          return rows;
-        },
-      };
-    },
-  };
-
-  console.log("✅  Database ready:", DB_PATH);
-  _resolve();
-}
-
-// ── Boot ──────────────────────────────────────────────────────────────────────
-(IS_TURSO ? initTurso() : initLocal()).catch(err => {
-  console.error("❌  Database init failed:", err);
-  _reject(err);
-  process.exit(1);
 });
 
-module.exports = { ready, prepare: (sql) => db.prepare(sql) };
+router.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: "Email and password required." });
+
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase());
+    const hashToCheck = user?.password || "$2a$12$invalidhashfortimingprotection000000000000000000000";
+    const valid = await bcrypt.compare(password, hashToCheck);
+
+    if (!user || !valid) return res.status(401).json({ message: "Invalid email or password." });
+
+    const now = Math.floor(Date.now() / 1000);
+    await db.prepare("UPDATE users SET last_active = ? WHERE id = ?").run(now, user.id);
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.json({ token });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ message: "Internal server error." });
+  }
+});
+
+module.exports = router;
